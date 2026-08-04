@@ -1,4 +1,5 @@
 import re
+import calendar
 import datetime
 import pandas as pd
 import plotly.express as px
@@ -7,29 +8,24 @@ import streamlit as st
 
 # ---------------- 1. 页面基本配置 ----------------
 st.set_page_config(
-    page_title="Callie FR 数据看板", page_icon="https://flagcdn.com/w80/fr.png", layout="wide"
+    page_title="Callie FR 数据看板", 
+    page_icon="https://flagcdn.com/w80/fr.png", 
+    layout="wide"
 )
 
-col_flag, col_title = st.columns([0.06, 0.94], gap="small")
-
-with col_flag:
-    # 展示法国国旗图片
-    st.image("https://flagcdn.com/w80/fr.png", width=55)
-
-with col_title:
-    st.title("Callie FR 数据看板")
-
-st.caption("数据源：Google Sheet (ALL 工作表) | 支持周期环比对比与单图表独立时间筛选")
+# ---------------- 2. 统一看板名称 ----------------
+st.title("Callie FR 数据看板")
+st.caption("数据源：Google Sheet | 支持全局时间联动、跨周期对比与目标进度追踪")
 
 # 真实 Google Sheet 链接
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1GLAGMkVx5DMXylG0bbdvkzuqTd8IVfDANhcRrAX6LFU/edit?usp=sharing"
 
-# 星期映射字典
+# 星期映射字典 (英文缩写)
 WEEKDAY_MAP = {
     0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"
 }
 
-# ---------------- 2. 直连读取 Google Sheet 数据 ----------------
+# ---------------- 3. 读取 Google Sheet 主表数据 (ALL) ----------------
 @st.cache_data(ttl=1800)  # 每 30 分钟自动刷新一次数据
 def load_and_transform_data():
     sheet_id_match = re.search(r"/d/([a-zA-Z0-9-_]+)", SHEET_URL)
@@ -37,27 +33,20 @@ def load_and_transform_data():
         raise ValueError("无效的 Google Sheet 链接！")
     sheet_id = sheet_id_match.group(1)
 
-    # 通过 GViz CSV 接口读取 ALL 工作表
     csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet=ALL"
     raw_df = pd.read_csv(csv_url)
 
-    # 1. 截取前 18 行（指标数据）
     raw_df = raw_df.iloc[0:18].copy()
-
-    # 2. 获取指标列名称
     metric_col = raw_df.columns[0]
 
-    # 3. 转置：横向日期变纵向行
     df_transposed = raw_df.set_index(metric_col).T.reset_index()
     df_transposed.rename(columns={"index": "Date_Raw"}, inplace=True)
 
-    # 4. 解析与清洗日期
     df_transposed["Date"] = pd.to_datetime(
         df_transposed["Date_Raw"], errors="coerce"
     )
     df_transposed = df_transposed.dropna(subset=["Date"])
 
-    # 5. 格式化横坐标标签（格式：2026-07-27 (周一)）
     df_transposed["Weekday"] = df_transposed["Date"].dt.weekday.map(WEEKDAY_MAP)
     df_transposed["Date_Label"] = (
         df_transposed["Date"].dt.strftime("%Y-%m-%d")
@@ -66,7 +55,6 @@ def load_and_transform_data():
         + ")"
     )
 
-    # 6. 自动剔除 $、,、% 并转为数值
     for col in df_transposed.columns:
         if col not in ["Date_Raw", "Date", "Weekday", "Date_Label", "星期"]:
             clean_series = (
@@ -79,10 +67,8 @@ def load_and_transform_data():
             )
             df_transposed[col] = pd.to_numeric(clean_series, errors="coerce")
 
-    # 按时间升序排列
     df_transposed = df_transposed.sort_values(by="Date").reset_index(drop=True)
 
-    # 计算 Superset SEO 销售额占比 (%)
     if (
         "Superset SEO销售额" in df_transposed.columns
         and "Superset 总销售额" in df_transposed.columns
@@ -93,97 +79,382 @@ def load_and_transform_data():
             * 100
         ).round(2)
 
-    return df_transposed
+    return df_transposed, sheet_id
 
 
-# 辅助函数：根据单个图表选择的时间范围过滤数据
-def filter_df_by_date(df, date_range):
-    if not date_range:
-        return df
+# ---------------- 4. 读取第二个表单 (SEO销售额目标完成情况) ----------------
+@st.cache_data(ttl=1800)
+def load_sales_target_data(sheet_id):
+    try:
+        # 表单名：SEO销售额目标完成情况
+        csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet=SEO%E9%94%80%E5%94%AE%E9%A2%9D%E7%9B%AE%E6%A0%87%E5%AE%8C%E6%80%90%E6%83%85%E5%86%B5"
+        target_df = pd.read_csv(csv_url, header=None)
+        
+        # C 列为 FR 站数据 (索引为 2)
+        fr_col = target_df.iloc[:, 2]
+        
+        # 行号 724 (索引 723) 为总目标额
+        target_val_raw = fr_col.iloc[723] if len(fr_col) >= 724 else None
+        
+        target_val = 0.0
+        if pd.notna(target_val_raw):
+            clean_str = str(target_val_raw).replace("$", "").replace(",", "").strip()
+            try:
+                target_val = float(clean_str)
+            except ValueError:
+                target_val = 0.0
 
-    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
-        start_date, end_date = date_range
-        mask = (df["Date"] >= pd.Timestamp(start_date)) & (
-            df["Date"] <= pd.Timestamp(end_date)
-        )
-        return df.loc[mask]
+        # 如果 724 行读取不到，降级提取 689-719 行 (索引 688:719) 求和
+        if target_val <= 0:
+            sub_rows = fr_col.iloc[688:719]
+            clean_sub = sub_rows.astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False).str.strip()
+            target_val = pd.to_numeric(clean_sub, errors="coerce").sum()
 
-    elif isinstance(date_range, (list, tuple)) and len(date_range) == 1:
-        start_date = date_range[0]
-        mask = df["Date"] >= pd.Timestamp(start_date)
-        return df.loc[mask]
-
-    return df
+        return target_val
+    except Exception as e:
+        # 默认备用逻辑
+        return 46900.0
 
 
 try:
-    df = load_and_transform_data()
+    df, sheet_id = load_and_transform_data()
+    sales_target_august = load_sales_target_data(sheet_id)
+
     min_d = df["Date"].min().to_pydatetime()
     max_d = df["Date"].max().to_pydatetime()
 
-    # 默认选中的时间范围：最近一周
-    default_start = max_d - pd.Timedelta(days=6)
-    if default_start < min_d:
-        default_start = min_d
-    default_range = [default_start, max_d]
+    # 默认选中的时间范围：上一个完整自然周（上周一 至 上周日）
+    this_week_monday = max_d - pd.Timedelta(days=max_d.weekday())
+    last_week_monday = this_week_monday - pd.Timedelta(days=7)
+    last_week_sunday = last_week_monday + pd.Timedelta(days=6)
+
+    default_start = max(last_week_monday, min_d)
+    default_end = min(last_week_sunday, max_d)
+    default_range = [default_start, default_end]
 
     # =========================================================================
-    # 🌟 顶部：核心指标周期对比表格 (周/月/年/自定义)
+    # 📌 侧边栏置顶：全局统一时间选择器
     # =========================================================================
-    st.header("📊 核心数据周期对比 (周/月/年 环比)")
+    st.sidebar.header("🗓️ 全局时间筛选器")
+    st.sidebar.caption("在此处调整时间，下方所有图表将自动同步更新！")
     
-    col_mode, col_date = st.columns([1, 2])
-    with col_mode:
-        compare_mode = st.radio(
-            "选择对比周期粒度：",
-            ["周 (Week)", "月 (Month)", "自定义时间段"],
-            horizontal=True,
-            key="compare_mode"
-        )
-    
-    # 根据选择模式计算本期与上期
-    if compare_mode == "周 (Week)":
-        # 当前最新日期所在周的上周一与上周日作为本期
-        curr_end = max_d
-        curr_start = max_d - pd.Timedelta(days=6)
-        prev_end = curr_start - pd.Timedelta(days=1)
-        prev_start = prev_end - pd.Timedelta(days=6)
-        comp_label = "环比上周"
-    elif compare_mode == "月 (Month)":
-        # 默认最近 30 天 vs 再往前 30 天
-        curr_end = max_d
-        curr_start = max_d - pd.Timedelta(days=29)
-        prev_end = curr_start - pd.Timedelta(days=1)
-        prev_start = prev_end - pd.Timedelta(days=29)
-        comp_label = "环比上月"
+    selected_date_range = st.sidebar.date_input(
+        "📅 选择看板分析时间段：",
+        value=default_range,
+        min_value=min_d,
+        max_value=max_d,
+        key="global_date_picker"
+    )
+
+    if isinstance(selected_date_range, (list, tuple)) and len(selected_date_range) == 2:
+        curr_start, curr_end = selected_date_range[0], selected_date_range[1]
     else:
-        with col_date:
-            custom_range = st.date_input(
-                "📅 选择本期时间段（系统将自动计算同等长度的前一周期）：",
-                value=default_range,
-                min_value=min_d,
-                max_value=max_d,
-                key="custom_compare_range"
-            )
-            if isinstance(custom_range, (list, tuple)) and len(custom_range) == 2:
-                curr_start, curr_end = custom_range[0], custom_range[1]
-                days_diff = (curr_end - curr_start).days
-                prev_end = curr_start - pd.Timedelta(days=1)
-                prev_start = prev_end - pd.Timedelta(days=days_diff)
-            else:
-                curr_start, curr_end = default_start, max_d
-                prev_start, prev_end = curr_start - pd.Timedelta(days=7), curr_start - pd.Timedelta(days=1)
-        comp_label = f"环比前{ (curr_end - curr_start).days + 1 }天"
+        curr_start, curr_end = default_start, default_end
 
-    # 格式化日期显示字符串 (例如 7/13-7/19)
+    days_span = (curr_end - curr_start).days + 1
+    prev_end = curr_start - pd.Timedelta(days=1)
+    prev_start = prev_end - pd.Timedelta(days=days_span - 1)
+
+    df_curr = df[(df["Date"] >= pd.Timestamp(curr_start)) & (df["Date"] <= pd.Timestamp(curr_end))].copy()
+    df_prev = df[(df["Date"] >= pd.Timestamp(prev_start)) & (df["Date"] <= pd.Timestamp(prev_end))].copy()
+
+    st.sidebar.info(
+        f"**当前选择本期：**\n{curr_start.strftime('%Y-%m-%d')} ~ {curr_end.strftime('%Y-%m-%d')} ({days_span}天)\n\n"
+        f"**自动对比上期：**\n{prev_start.strftime('%Y-%m-%d')} ~ {prev_end.strftime('%Y-%m-%d')}"
+    )
+
+    # =========================================================================
+    # 🎯 顶部分栏：目标完成进度卡片 (销售额 & 流量)
+    # =========================================================================
+    latest_date = max_d
+    current_year = latest_date.year
+    current_month = latest_date.month
+    current_day = latest_date.day
+    _, days_in_month = calendar.monthrange(current_year, current_month)
+
+    # 1. 动态过滤出本月所有已产生的数据
+    df_this_month = df[
+        (df["Date"].dt.year == current_year) & 
+        (df["Date"].dt.month == current_month)
+    ]
+
+    # --- 销售额统计 ---
+    actual_sales_this_month = (
+        df_this_month["Superset SEO销售额"].sum() 
+        if "Superset SEO销售额" in df_this_month.columns else 0.0
+    )
+    target_sales_this_month = sales_target_august if sales_target_august > 0 else 46900.0
+    
+    sales_pct = (actual_sales_this_month / target_sales_this_month * 100) if target_sales_this_month > 0 else 0.0
+    time_pct = (current_day / days_in_month * 100)
+
+    # 提示语逻辑
+    if sales_pct >= time_pct:
+        sales_status_text = "🔥 销售额超前！"
+    else:
+        sales_status_text = "✨ 销售额努力冲刺中！"
+
+    # --- 流量统计 ---
+    actual_traffic_this_month = (
+        df_this_month["SEO 总流量"].sum() 
+        if "SEO 总流量" in df_this_month.columns else 0.0
+    )
+    # 流量目标留用预留位（默认预设 95,800，可自定义修改）
+    DEFAULT_TRAFFIC_TARGET = 95800.0
+    target_traffic_this_month = DEFAULT_TRAFFIC_TARGET
+    
+    traffic_pct = (actual_traffic_this_month / target_traffic_this_month * 100) if target_traffic_this_month > 0 else 0.0
+
+    if traffic_pct >= time_pct:
+        traffic_status_text = "🚀 流量表现强劲！"
+    else:
+        traffic_status_text = "✨ 流量蓄力中，冲鸭！"
+
+    # 渲染目标卡片 CSS HTML
+    st.markdown("""
+    <style>
+    .target-card {
+        background-color: #FFFFFF;
+        border: 1px solid #EAEAEA;
+        border-radius: 12px;
+        padding: 18px 22px;
+        box-shadow: 0px 2px 6px rgba(0,0,0,0.02);
+        margin-bottom: 20px;
+    }
+    .card-header-title {
+        font-size: 18px;
+        font-weight: 700;
+        color: #111827;
+        margin-bottom: 14px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+    .metric-label {
+        font-size: 13px;
+        color: #6B7280;
+        margin-bottom: 2px;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+    }
+    .metric-value {
+        font-size: 22px;
+        font-weight: 800;
+        color: #111827;
+        margin-bottom: 12px;
+    }
+    .badge-pct {
+        display: inline-block;
+        background-color: #E6F4EA;
+        color: #137333;
+        font-size: 12px;
+        font-weight: 600;
+        padding: 2px 8px;
+        border-radius: 12px;
+        margin-top: 4px;
+    }
+    .progress-bar-bg {
+        background-color: #F3F4F6;
+        border-radius: 10px;
+        height: 16px;
+        width: 100%;
+        position: relative;
+        overflow: hidden;
+        margin-top: 4px;
+    }
+    .progress-bar-fill-sales {
+        background: linear-gradient(90deg, #FF9A9E 0%, #FECFEF 99%, #FECFEF 100%);
+        background-color: #FF5376;
+        height: 100%;
+        border-radius: 10px;
+    }
+    .progress-bar-fill-time {
+        background-color: #60A5FA;
+        height: 100%;
+        border-radius: 10px;
+    }
+    .progress-bar-fill-traffic {
+        background: linear-gradient(90deg, #A1C4FD 0%, #C2E9FB 100%);
+        background-color: #3B82F6;
+        height: 100%;
+        border-radius: 10px;
+    }
+    .flag-icon {
+        position: absolute;
+        right: 8px;
+        top: 0px;
+        font-size: 11px;
+        line-height: 16px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    col_target1, col_target2 = st.columns(2)
+
+    # 1. 销售额目标进度卡片
+    with col_target1:
+        sales_bar_width = min(sales_pct, 100.0)
+        time_bar_width = min(time_pct, 100.0)
+        
+        st.markdown(f"""
+        <div class="target-card">
+            <div class="card-header-title">💰 销售额目标进度</div>
+            <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                <div style="width: 35%;">
+                    <div class="metric-label">🎯 本月销售总目标</div>
+                    <div class="metric-value">${target_sales_this_month:,.2f}</div>
+                    <div class="metric-label">💰 累计实际完成</div>
+                    <div class="metric-value" style="margin-bottom: 2px;">${actual_sales_this_month:,.2f}</div>
+                    <div><span class="badge-pct">↑ 进度 {sales_pct:.1f}%</span></div>
+                </div>
+                <div style="width: 62%;">
+                    <div style="display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; margin-bottom: 4px;">
+                        <span>{sales_status_text}</span>
+                        <span style="color: #E11D48; font-weight: 700;">{sales_pct:.1f}%</span>
+                    </div>
+                    <div class="progress-bar-bg" style="margin-bottom: 18px;">
+                        <div style="width: {sales_bar_width}%; height: 100%; background: #FF5376; border-radius: 10px; position: relative;">
+                            <span style="position: absolute; right: -8px; top: -2px; font-size: 14px;">🚀</span>
+                        </div>
+                        <span class="flag-icon">🏁</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; font-size: 12px; color: #6B7280; margin-bottom: 4px;">
+                        <span>⏳ 时间进度 ({current_day} / {days_in_month} 天)</span>
+                        <span>{time_pct:.1f}%</span>
+                    </div>
+                    <div class="progress-bar-bg" style="height: 8px;">
+                        <div class="progress-bar-fill-time" style="width: {time_bar_width}%;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # 2. SEO流量目标进度卡片
+    with col_target2:
+        traffic_bar_width = min(traffic_pct, 100.0)
+        
+        st.markdown(f"""
+        <div class="target-card">
+            <div class="card-header-title">🌊 SEO流量目标进度</div>
+            <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                <div style="width: 35%;">
+                    <div class="metric-label">🎯 本月流量总目标</div>
+                    <div class="metric-value">{int(target_traffic_this_month):,}</div>
+                    <div class="metric-label">🌊 累计实际流量</div>
+                    <div class="metric-value" style="margin-bottom: 2px;">{int(actual_traffic_this_month):,}</div>
+                    <div><span class="badge-pct">↑ 进度 {traffic_pct:.1f}%</span></div>
+                </div>
+                <div style="width: 62%;">
+                    <div style="display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; margin-bottom: 4px;">
+                        <span>{traffic_status_text}</span>
+                        <span style="color: #2563EB; font-weight: 700;">{traffic_pct:.1f}%</span>
+                    </div>
+                    <div class="progress-bar-bg" style="margin-bottom: 18px;">
+                        <div style="width: {traffic_bar_width}%; height: 100%; background: #2563EB; border-radius: 10px; position: relative;">
+                            <span style="position: absolute; right: -8px; top: -2px; font-size: 14px;">🚀</span>
+                        </div>
+                        <span class="flag-icon">🏁</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; font-size: 12px; color: #6B7280; margin-bottom: 4px;">
+                        <span>⏳ 时间进度 ({current_day} / {days_in_month} 天)</span>
+                        <span>{time_pct:.1f}%</span>
+                    </div>
+                    <div class="progress-bar-bg" style="height: 8px;">
+                        <div class="progress-bar-fill-time" style="width: {time_bar_width}%;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # 辅助函数：生成单日常规对比折线图 (法国蓝红配色)
+    def create_comparison_figure(df_c, df_p, metric_cols, title, y_title="数值"):
+        fig = px_go.Figure()
+        for i, col in enumerate(metric_cols):
+            if col in df_c.columns:
+                line_color = "#002654" if i == 0 else "#1D70B8"
+                fig.add_trace(px_go.Scatter(
+                    x=df_c["Date_Label"],
+                    y=df_c[col],
+                    name=f"[本期] {col}",
+                    line=dict(color=line_color, width=3),
+                    mode="lines+markers"
+                ))
+        
+        df_p_aligned = df_p.reset_index(drop=True)
+        df_c_aligned = df_c.reset_index(drop=True)
+        
+        for i, col in enumerate(metric_cols):
+            if col in df_p_aligned.columns:
+                line_color = "#CE1126" if i == 0 else "#E66371"
+                fig.add_trace(px_go.Scatter(
+                    x=df_c_aligned["Date_Label"],
+                    y=df_p_aligned[col],
+                    name=f"[上期] {col}",
+                    line=dict(color=line_color, width=2, dash="dash"),
+                    mode="lines"
+                ))
+
+        fig.update_layout(
+            title=title,
+            hovermode="x unified",
+            xaxis_title="Date",
+            yaxis_title=y_title,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        return fig
+
+    # 辅助函数：绘制“总数值对比”柱状图 (法国蓝红配色)
+    def create_total_bar_chart(df_c, df_p, metric_cols, title, y_title="累计总数", is_currency=True):
+        categories = []
+        c_totals = []
+        p_totals = []
+
+        for col in metric_cols:
+            if col in df_c.columns:
+                categories.append(col)
+                c_totals.append(df_c[col].sum())
+                p_totals.append(df_p[col].sum() if col in df_p.columns else 0.0)
+
+        fmt_func = (lambda v: f"${v:,.2f}") if is_currency else (lambda v: f"{int(v):,}")
+
+        fig = px_go.Figure()
+        fig.add_trace(px_go.Bar(
+            x=categories,
+            y=c_totals,
+            name="本期总额" if is_currency else "本期总量",
+            marker_color="#002654",
+            text=[fmt_func(v) for v in c_totals],
+            textposition="auto"
+        ))
+        fig.add_trace(px_go.Bar(
+            x=categories,
+            y=p_totals,
+            name="上期总额" if is_currency else "上期总量",
+            marker_color="#CE1126",
+            text=[fmt_func(v) for v in p_totals],
+            textposition="auto"
+        ))
+
+        fig.update_layout(
+            title=title,
+            barmode="group",
+            yaxis_title=y_title,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        return fig
+
+    # =========================================================================
+    # 📊 1. 核心指标周期对比表格
+    # =========================================================================
+    st.header("📊 核心数据周期对比 (本期 vs 上期)")
+    
     curr_str = f"{curr_start.strftime('%m/%d')}-{curr_end.strftime('%m/%d')}"
     prev_str = f"{prev_start.strftime('%m/%d')}-{prev_end.strftime('%m/%d')}"
+    comp_label = f"环比前 {days_span} 天"
 
-    # 提取本期与上期数据
-    df_curr = df[(df["Date"] >= pd.Timestamp(curr_start)) & (df["Date"] <= pd.Timestamp(curr_end))]
-    df_prev = df[(df["Date"] >= pd.Timestamp(prev_start)) & (df["Date"] <= pd.Timestamp(prev_end))]
-
-    # 定义对比维度与列名映射 (指标名 -> Sheet中对应列名 / 格式类型)
     metrics_config = [
         {"name": "销售额 (Superset)", "col": "Superset SEO销售额", "type": "currency"},
         {"name": "流量 (GA4 SEO总流量)", "col": "SEO 总流量", "type": "number"},
@@ -204,11 +475,9 @@ try:
         col_name = m["col"]
         m_type = m["type"]
         
-        # 本期值与上期值求和
         v_curr = df_curr[col_name].sum() if col_name in df_curr.columns else 0.0
         v_prev = df_prev[col_name].sum() if col_name in df_prev.columns else 0.0
 
-        # 计算环比增长率
         if v_prev > 0:
             growth = ((v_curr - v_prev) / v_prev) * 100
             growth_str = f"{growth:+.2f}%"
@@ -217,7 +486,6 @@ try:
         else:
             growth_str = "0.00%"
 
-        # 格式化显示数值
         if m_type == "currency":
             curr_fmt = f"${v_curr:,.2f}"
             prev_fmt = f"${v_prev:,.2f}"
@@ -227,120 +495,136 @@ try:
 
         table_rows.append({
             "日期指标": m["name"],
-            prev_str: prev_fmt,
-            curr_str: curr_fmt,
+            f"上期 ({prev_str})": prev_fmt,
+            f"本期 ({curr_str})": curr_fmt,
             comp_label: growth_str
         })
 
     comp_df = pd.DataFrame(table_rows)
 
-    # 使用 HTML 渲染高颜值对比表格（支持涨红跌绿/涨绿跌红高亮）
     def style_growth(val):
         if val.startswith("+"):
-            return f"<span style='color: #2D6A4F; font-weight: bold;'>{val}</span>"
+            return f"<span style='color: #002654; font-weight: bold;'>{val}</span>"
         elif val.startswith("-"):
-            return f"<span style='color: #D90429; font-weight: bold;'>{val}</span>"
+            return f"<span style='color: #CE1126; font-weight: bold;'>{val}</span>"
         return f"<span>{val}</span>"
 
     comp_df[comp_label] = comp_df[comp_label].apply(style_growth)
 
-    # 渲染 Markdown 表格
-    st.write(
-        comp_df.to_html(escape=False, index=False),
-        unsafe_allow_html=True
-    )
-    st.caption("💡 提示：点击类指标若 Google Sheet 中尚未添加对应列，默认显示 0；表格内环比自动依据选择的时间跨度精确计算。")
-
+    st.write(comp_df.to_html(escape=False, index=False), unsafe_allow_html=True)
     st.markdown("---")
 
     # =========================================================================
     # 图表 1：Superset 销售额对比与占比
     # =========================================================================
-    st.header("1. Superset 销售额对比与 SEO 占比")
-    d1 = st.date_input(
-        "📅 选择时间范围 (Superset 销售额)",
-        value=default_range,
-        min_value=min_d,
-        max_value=max_d,
-        key="d1",
-    )
-    df1 = filter_df_by_date(df, d1)
+    st.header("1. 销售额表现（Superset）")
+    col_sup1, col_sup2 = st.columns([2, 1.2])
 
-    fig1 = px_go.Figure()
-    fig1.add_trace(
-        px_go.Bar(
-            x=df1["Date_Label"],
-            y=df1.get("Superset 总销售额", df1.iloc[:, 1]),
-            name="Superset 总销售额 ($)",
-            marker_color="#2D6A4F",
-        )
-    )
-    if "Superset SEO销售额" in df1.columns:
-        fig1.add_trace(
-            px_go.Scatter(
-                x=df1["Date_Label"],
-                y=df1["Superset SEO销售额"],
-                name="Superset SEO销售额 ($)",
-                line=dict(color="#52B788", width=3),
-            )
-        )
-    if "SEO销售额占比(%)" in df1.columns:
-        fig1.add_trace(
-            px_go.Scatter(
-                x=df1["Date_Label"],
-                y=df1["SEO销售额占比(%)"],
-                name="SEO 销售额占比 (%)",
-                yaxis="y2",
-                line=dict(color="#D8F3DC", width=2, dash="dot"),
-            )
-        )
+    with col_sup1:
+        df_p_aligned = df_prev.reset_index(drop=True)
+        df_c_aligned = df_curr.reset_index(drop=True)
 
-    fig1.update_layout(
-        title="Superset 总销售额 vs SEO 销售额与占比走势",
-        hovermode="x unified",
-        xaxis_title="Date",
-        yaxis=dict(title="销售额 ($)"),
-        yaxis2=dict(
-            title="SEO 占比 (%)", overlaying="y", side="right", showgrid=False
-        ),
-        legend=dict(
-            orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1
-        ),
-    )
-    st.plotly_chart(fig1, use_container_width=True)
+        fig1 = px_go.Figure()
+        fig1.add_trace(px_go.Bar(
+            x=df_c_aligned["Date_Label"],
+            y=df_c_aligned.get("Superset 总销售额", [0]*len(df_c_aligned)),
+            name="[本期] Superset 总销售额 ($)",
+            marker_color="#002654"
+        ))
+        fig1.add_trace(px_go.Bar(
+            x=df_c_aligned["Date_Label"],
+            y=df_p_aligned.get("Superset 总销售额", [0]*len(df_p_aligned)),
+            name="[上期] Superset 总销售额 ($)",
+            marker_color="#CE1126",
+            opacity=0.5
+        ))
+        if "Superset SEO销售额" in df_c_aligned.columns:
+            fig1.add_trace(px_go.Scatter(
+                x=df_c_aligned["Date_Label"],
+                y=df_c_aligned["Superset SEO销售额"],
+                name="[本期] Superset SEO销售额 ($)",
+                line=dict(color="#1D70B8", width=3)
+            ))
+        if "Superset SEO销售额" in df_p_aligned.columns:
+            fig1.add_trace(px_go.Scatter(
+                x=df_c_aligned["Date_Label"],
+                y=df_p_aligned["Superset SEO销售额"],
+                name="[上期] Superset SEO销售额 ($)",
+                line=dict(color="#E66371", width=2, dash="dash")
+            ))
+
+        fig1.update_layout(
+            title="Superset 每日销售额走势 (本期 vs 上期)",
+            hovermode="x unified",
+            barmode="group",
+            xaxis_title="Date",
+            yaxis=dict(title="销售额 ($)"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig1, use_container_width=True)
+
+    with col_sup2:
+        tab_sup_all, tab_sup_seo = st.tabs(["📊 总销售额与 SEO 销售额", "🎯 仅看 SEO 销售额"])
+        
+        with tab_sup_all:
+            fig1_total_all = create_total_bar_chart(
+                df_curr, df_prev, 
+                ["Superset 总销售额", "Superset SEO销售额"], 
+                "Superset 所选周期销售总额对比",
+                y_title="累计总销售额 ($)",
+                is_currency=True
+            )
+            st.plotly_chart(fig1_total_all, use_container_width=True)
+            
+        with tab_sup_seo:
+            fig1_total_seo = create_total_bar_chart(
+                df_curr, df_prev, 
+                ["Superset SEO销售额"], 
+                "Superset SEO 销售额对比 (独立缩放)",
+                y_title="SEO 累计销售额 ($)",
+                is_currency=True
+            )
+            st.plotly_chart(fig1_total_seo, use_container_width=True)
 
     st.markdown("---")
 
     # =========================================================================
     # 图表 2：GA4 销售额对比
     # =========================================================================
-    st.header("2. GA4 平台销售额对比")
-    d2 = st.date_input(
-        "📅 选择时间范围 (GA4 销售额)",
-        value=default_range,
-        min_value=min_d,
-        max_value=max_d,
-        key="d2",
-    )
-    df2 = filter_df_by_date(df, d2)
+    st.header("2. 销售额表现（GA4）")
+    col_ga1, col_ga2 = st.columns([2, 1.2])
 
-    ga4_cols = [
-        c for c in ["GA4 网站总销售额", "GA4 SEO销售额"] if c in df2.columns
-    ]
-    if ga4_cols:
-        fig2 = px.line(
-            df2,
-            x="Date_Label",
-            y=ga4_cols,
-            labels={"value": "金额 ($)", "variable": "指标类别", "Date_Label": "Date"},
-            color_discrete_map={
-                "GA4 网站总销售额": "#1B4332",
-                "GA4 SEO销售额": "#74C69D",
-            },
-            title="GA4 网站总销售额 vs GA4 SEO销售额 趋势",
+    with col_ga1:
+        fig2 = create_comparison_figure(
+            df_curr, df_prev, 
+            ["GA4 网站总销售额", "GA4 SEO销售额"], 
+            "GA4 每日销售额趋势 (本期 vs 上期)", 
+            y_title="金额 ($)"
         )
-        fig2.update_layout(hovermode="x unified")
         st.plotly_chart(fig2, use_container_width=True)
+
+    with col_ga2:
+        tab_ga_all, tab_ga_seo = st.tabs(["📊 总销售额与 SEO 销售额", "🎯 仅看 SEO 销售额"])
+        
+        with tab_ga_all:
+            fig2_total_all = create_total_bar_chart(
+                df_curr, df_prev, 
+                ["GA4 网站总销售额", "GA4 SEO销售额"], 
+                "GA4 所选周期销售总额对比",
+                y_title="累计总销售额 ($)",
+                is_currency=True
+            )
+            st.plotly_chart(fig2_total_all, use_container_width=True)
+            
+        with tab_ga_seo:
+            fig2_total_seo = create_total_bar_chart(
+                df_curr, df_prev, 
+                ["GA4 SEO销售额"], 
+                "GA4 SEO 销售额对比 (独立缩放)",
+                y_title="SEO 累计销售额 ($)",
+                is_currency=True
+            )
+            st.plotly_chart(fig2_total_seo, use_container_width=True)
 
     st.markdown("---")
 
@@ -348,67 +632,41 @@ try:
     # 图表 3：多渠道流量对比
     # =========================================================================
     st.header("3. 多渠道流量对比")
-    d3 = st.date_input(
-        "📅 选择时间范围 (流量对比)",
-        value=default_range,
-        min_value=min_d,
-        max_value=max_d,
-        key="d3",
-    )
-    df3 = filter_df_by_date(df, d3)
+    col_tr1, col_tr2 = st.columns([2, 1.2])
 
-    traffic_cols = [
-        c
-        for c in ["网站总流量", "SEO 总流量", "SEO Blog流量", "SEO 站内流量"]
-        if c in df3.columns
-    ]
-    if traffic_cols:
-        fig3 = px.line(
-            df3,
-            x="Date_Label",
-            y=traffic_cols,
-            labels={
-                "value": "访客量 (Sessions)",
-                "variable": "流量渠道",
-                "Date_Label": "Date",
-            },
-            color_discrete_sequence=[
-                "#081C15",
-                "#2D6A4F",
-                "#52B788",
-                "#B7E4C7"
-            ],
-            title="网站总流量 / SEO总流量 / Blog流量 / 站内流量全貌对比",
+    with col_tr1:
+        fig3 = create_comparison_figure(
+            df_curr, df_prev, 
+            ["SEO 总流量", "SEO Blog流量", "SEO 站内流量"], 
+            "SEO 渠道流量趋势与上期对比", 
+            y_title="访客量 (Sessions)"
         )
-        fig3.update_layout(hovermode="x unified")
         st.plotly_chart(fig3, use_container_width=True)
+
+    with col_tr2:
+        fig3_total = create_total_bar_chart(
+            df_curr, df_prev, 
+            ["SEO 总流量", "SEO Blog流量", "SEO 站内流量"], 
+            "多渠道所选周期总流量对比",
+            y_title="累计总访客量 (Sessions)",
+            is_currency=False
+        )
+        st.plotly_chart(fig3_total, use_container_width=True)
 
     st.markdown("---")
 
     # =========================================================================
     # 图表 4：跳出率
     # =========================================================================
-    st.header("4. 网站跳出率 (Bounce Rate)")
-    d4 = st.date_input(
-        "📅 选择时间范围 (跳出率)",
-        value=default_range,
-        min_value=min_d,
-        max_value=max_d,
-        key="d4",
+    st.header("4. 网站跳出率 Bounce Rate对比")
+    fig4 = create_comparison_figure(
+        df_curr, df_prev, 
+        ["跳出率"], 
+        "每日跳出率波动与上期对比", 
+        y_title="跳出率 (%)"
     )
-    df4 = filter_df_by_date(df, d4)
-
-    if "跳出率" in df4.columns:
-        fig4 = px.area(
-            df4,
-            x="Date_Label",
-            y="跳出率",
-            labels={"跳出率": "跳出率 (%)", "Date_Label": "Date"},
-            title="每日跳出率波动趋势",
-            color_discrete_sequence=["#95D5B2"],
-        )
-        fig4.update_layout(hovermode="x unified", yaxis_range=[0, 100])
-        st.plotly_chart(fig4, use_container_width=True)
+    fig4.update_layout(yaxis_range=[0, 100])
+    st.plotly_chart(fig4, use_container_width=True)
 
     st.markdown("---")
 
@@ -416,72 +674,62 @@ try:
     # 图表 5：AI Assistant (GEO) 表现
     # =========================================================================
     st.header("5. AI Assistant 表现 (GEO 销售与流量)")
-    d5 = st.date_input(
-        "📅 选择时间范围 (AI Assistant)",
-        value=default_range,
-        min_value=min_d,
-        max_value=max_d,
-        key="d5",
-    )
-    df5 = filter_df_by_date(df, d5)
-
-    col_ai1, col_ai2 = st.columns(2)
+    col_ai1, col_ai2, col_ai3 = st.columns([1.1, 1.1, 1.2])
 
     with col_ai1:
-        if "AI Assistant 销售额" in df5.columns:
-            fig5_sales = px.bar(
-                df5,
-                x="Date_Label",
-                y="AI Assistant 销售额",
-                labels={"AI Assistant 销售额": "销售额 ($)", "Date_Label": "Date"},
-                title="AI Assistant 每日销售额 ($)",
-                color_discrete_sequence=["#1B4332"],
-            )
-            st.plotly_chart(fig5_sales, use_container_width=True)
+        fig5_sales = create_comparison_figure(
+            df_curr, df_prev, 
+            ["AI Assistant 销售额"], 
+            "AI Assistant 每日销售额 ($)", 
+            y_title="销售额 ($)"
+        )
+        st.plotly_chart(fig5_sales, use_container_width=True)
 
     with col_ai2:
-        if "AI Assistant 流量" in df5.columns:
-            fig5_traffic = px.line(
-                df5,
-                x="Date_Label",
-                y="AI Assistant 流量",
-                labels={"AI Assistant 流量": "访客量", "Date_Label": "Date"},
-                title="AI Assistant 每日引流 (Sessions)",
-                color_discrete_sequence=["#40916C"],
+        fig5_traffic = create_comparison_figure(
+            df_curr, df_prev, 
+            ["AI Assistant 流量"], 
+            "AI Assistant 每日引流 (Sessions)", 
+            y_title="访客量"
+        )
+        st.plotly_chart(fig5_traffic, use_container_width=True)
+
+    with col_ai3:
+        tab_ai_sales, tab_ai_traffic = st.tabs(["💰 销售总额对比", "👥 流量总数对比"])
+        
+        with tab_ai_sales:
+            fig5_total_sales = create_total_bar_chart(
+                df_curr, df_prev, 
+                ["AI Assistant 销售额"], 
+                "AI Assistant 销售总额对比",
+                y_title="累计总销售额 ($)",
+                is_currency=True
             )
-            fig5_traffic.update_traces(mode="lines+markers")
-            st.plotly_chart(fig5_traffic, use_container_width=True)
+            st.plotly_chart(fig5_total_sales, use_container_width=True)
+
+        with tab_ai_traffic:
+            fig5_total_traffic = create_total_bar_chart(
+                df_curr, df_prev, 
+                ["AI Assistant 流量"], 
+                "AI Assistant 引流总数对比",
+                y_title="累计总访客量 (Sessions)",
+                is_currency=False
+            )
+            st.plotly_chart(fig5_total_traffic, use_container_width=True)
 
     st.markdown("---")
 
     # =========================================================================
     # 图表 6：谷歌收录数据
     # =========================================================================
-    st.header("6. 谷歌收录数据")
-    d6 = st.date_input(
-        "📅 选择时间范围 (谷歌收录)",
-        value=default_range,
-        min_value=min_d,
-        max_value=max_d,
-        key="d6",
+    st.header("6. 谷歌收录数据对比 ")
+    fig6 = create_comparison_figure(
+        df_curr, df_prev, 
+        ["收录", "Blog 收录"], 
+        "总收录量与 Blog 专项收录量趋势", 
+        y_title="页数"
     )
-    df6 = filter_df_by_date(df, d6)
-
-    index_cols = [c for c in ["收录", "Blog 收录"] if c in df6.columns]
-    if index_cols:
-        fig6 = px.line(
-            df6,
-            x="Date_Label",
-            y=index_cols,
-            labels={"value": "页数", "variable": "收录类型", "Date_Label": "Date"},
-            color_discrete_map={
-                "收录": "#2D6A4F",
-                "Blog 收录": "#74C69D"
-            },
-            title="总收录量 vs Blog 专项收录量",
-        )
-        fig6.update_layout(hovermode="x unified")
-        st.plotly_chart(fig6, use_container_width=True)
+    st.plotly_chart(fig6, use_container_width=True)
 
     st.markdown("---")
 
@@ -489,42 +737,26 @@ try:
     # 图表 7：外链与外链域名广度
     # =========================================================================
     st.header("7. 外链与外链域名广度 (Backlinks)")
-    d7 = st.date_input(
-        "📅 选择时间范围 (外链)",
-        value=default_range,
-        min_value=min_d,
-        max_value=max_d,
-        key="d7",
-    )
-    df7 = filter_df_by_date(df, d7)
-
     col_link1, col_link2 = st.columns(2)
 
     with col_link1:
-        if "外链" in df7.columns:
-            fig7_links = px.line(
-                df7,
-                x="Date_Label",
-                y="外链",
-                labels={"外链": "外链数", "Date_Label": "Date"},
-                title="外链总数走势",
-                color_discrete_sequence=["#1B4332"],
-            )
-            st.plotly_chart(fig7_links, use_container_width=True)
+        fig7_links = create_comparison_figure(
+            df_curr, df_prev, 
+            ["外链"], 
+            "外链总数走势与上期对比", 
+            y_title="外链数"
+        )
+        st.plotly_chart(fig7_links, use_container_width=True)
 
     with col_link2:
-        if "外链域名广度" in df7.columns:
-            fig7_domains = px.line(
-                df7,
-                x="Date_Label",
-                y="外链域名广度",
-                labels={"外链域名广度": "域名数", "Date_Label": "Date"},
-                title="外链参照域名广度",
-                color_discrete_sequence=["#52B788"],
-            )
-            st.plotly_chart(fig7_domains, use_container_width=True)
+        fig7_domains = create_comparison_figure(
+            df_curr, df_prev, 
+            ["外链域名广度"], 
+            "外链参照域名广度与上期对比", 
+            y_title="域名数"
+        )
+        st.plotly_chart(fig7_domains, use_container_width=True)
 
-    # 底部表格明细
     with st.expander("📄 点击查看转换后的完整数据表"):
         st.dataframe(df.sort_values(by="Date", ascending=False))
 
